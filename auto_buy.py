@@ -463,15 +463,19 @@ class UserInterface:
                 print("❌ Por favor ingrese un número válido.")
     
     @staticmethod
-    def select_strategy(strategies: dict[str, InvestmentStrategy]) -> InvestmentStrategy:
+    def select_strategy_mode(
+        strategies: dict[str, InvestmentStrategy]
+    ) -> tuple[str, list[InvestmentStrategy]]:
         """
-        Permite al usuario seleccionar una estrategia.
+        Permite al usuario seleccionar una estrategia o el modo combinado.
         
         Args:
             strategies: Diccionario de estrategias disponibles.
             
         Returns:
-            InvestmentStrategy: Estrategia seleccionada.
+            tuple: (modo, lista_de_estrategias)
+                   modo: 'single' o 'combined'
+                   lista_de_estrategias: Lista con 1 o 2 estrategias
         """
         print("\n📋 Estrategias disponibles:")
         print("-" * 40)
@@ -484,15 +488,24 @@ class UserInterface:
                 print(f"      • {cat.name}: {cat.percentage}% ({options_str})")
             print()
         
+        # Opción adicional: ambas estrategias
+        print(f"  [3] 🔀 AMBAS ESTRATEGIAS (50% / 50%)")
+        print("      Divide el capital en partes iguales entre Moderada y Conservadora")
+        print("      Configura tokens para ambas y ejecuta todo en una sola operación")
+        print()
+        
         while True:
             try:
-                choice = input("Seleccione estrategia (1 o 2): ").strip()
-                idx = int(choice) - 1
+                choice = input("Seleccione estrategia (1, 2 o 3): ").strip()
+                idx = int(choice)
                 
-                if 0 <= idx < len(strategy_keys):
-                    selected = strategies[strategy_keys[idx]]
+                if idx == 3:
+                    logger.info("📌 Modo combinado: Ambas estrategias (50/50)")
+                    return ("combined", list(strategies.values()))
+                elif 1 <= idx <= len(strategy_keys):
+                    selected = strategies[strategy_keys[idx - 1]]
                     logger.info(f"📌 Estrategia seleccionada: {selected.name}")
-                    return selected
+                    return ("single", [selected])
                 else:
                     print("❌ Opción inválida.")
                     
@@ -667,16 +680,28 @@ class UserInterface:
         print("📋 RESUMEN DE ÓRDENES A EJECUTAR")
         print("=" * 60)
         
-        total = Decimal("0")
+        # Agrupar tokens iguales para mostrar consolidado
+        consolidated: dict[str, Decimal] = {}
         for token, amount in allocations:
+            if token in consolidated:
+                consolidated[token] += amount
+            else:
+                consolidated[token] = amount
+        
+        total = Decimal("0")
+        trade_count = 0
+        
+        for token, amount in sorted(consolidated.items(), key=lambda x: x[1], reverse=True):
             if token == "USDC":
-                print(f"  • {token}: {amount:.2f} USDC (se mantiene, sin operación)")
+                print(f"  💎 {token}: {amount:.2f} USDC (se mantiene, sin operación)")
             else:
                 print(f"  • {token}: {amount:.2f} USDC")
+                trade_count += 1
             total += amount
         
         print("-" * 40)
         print(f"  TOTAL: {total:.2f} USDC")
+        print(f"  Órdenes a ejecutar: {trade_count}")
         print("=" * 60)
         
         while True:
@@ -732,7 +757,7 @@ class TradingOrchestrator:
         allocations: list[tuple[str, Decimal]] = []
         
         print("\n" + "-" * 40)
-        print("🎯 CONFIGURACIÓN DE TOKENS")
+        print(f"🎯 CONFIGURACIÓN DE TOKENS - {strategy.name}")
         print("-" * 40)
         
         for category in strategy.categories:
@@ -752,6 +777,80 @@ class TradingOrchestrator:
                 allocations.append((token_selection.token, token_amount))
         
         return allocations
+    
+    def calculate_combined_allocations(
+        self,
+        strategies: list[InvestmentStrategy],
+        total_amount: Decimal
+    ) -> list[tuple[str, Decimal]]:
+        """
+        Calcula asignaciones para múltiples estrategias dividiendo el capital 50/50.
+        
+        Args:
+            strategies: Lista de estrategias a ejecutar.
+            total_amount: Monto total a invertir.
+            
+        Returns:
+            list: Lista de tuplas (token, monto) de todas las estrategias.
+        """
+        all_allocations: list[tuple[str, Decimal]] = []
+        amount_per_strategy = total_amount / Decimal(str(len(strategies)))
+        amount_per_strategy = amount_per_strategy.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        
+        print("\n" + "=" * 60)
+        print("🔀 MODO COMBINADO: Configuración de ambas estrategias")
+        print(f"   Capital por estrategia: {amount_per_strategy:.2f} USDC (50% c/u)")
+        print("=" * 60)
+        
+        for idx, strategy in enumerate(strategies, 1):
+            print(f"\n{'─' * 60}")
+            print(f"📊 ESTRATEGIA {idx}/{len(strategies)}: {strategy.name}")
+            print(f"   Monto asignado: {amount_per_strategy:.2f} USDC")
+            print(f"{'─' * 60}")
+            
+            strategy_allocations = self.calculate_allocations(strategy, amount_per_strategy)
+            all_allocations.extend(strategy_allocations)
+        
+        return all_allocations
+    
+    def consolidate_allocations(
+        self,
+        allocations: list[tuple[str, Decimal]]
+    ) -> list[tuple[str, Decimal]]:
+        """
+        Consolida asignaciones del mismo token sumando sus montos.
+        
+        Esto optimiza las órdenes cuando el mismo token aparece en
+        múltiples estrategias o categorías.
+        
+        Args:
+            allocations: Lista original de (token, monto).
+            
+        Returns:
+            list: Lista consolidada de (token, monto).
+        """
+        consolidated: dict[str, Decimal] = {}
+        
+        for token, amount in allocations:
+            if token in consolidated:
+                consolidated[token] += amount
+            else:
+                consolidated[token] = amount
+        
+        # Convertir de vuelta a lista de tuplas
+        result = [(token, amount) for token, amount in consolidated.items()]
+        
+        # Ordenar por monto descendente para ejecutar las órdenes más grandes primero
+        result.sort(key=lambda x: x[1], reverse=True)
+        
+        # Log si hubo consolidación
+        if len(result) < len(allocations):
+            logger.info(
+                f"🔄 Órdenes consolidadas: {len(allocations)} → {len(result)} "
+                f"(tokens duplicados combinados)"
+            )
+        
+        return result
     
     def validate_balance(self, total_amount: Decimal) -> bool:
         """
@@ -886,11 +985,18 @@ class TradingOrchestrator:
                 print("\n❌ Operación cancelada por saldo insuficiente.")
                 return
             
-            # Seleccionar estrategia
-            strategy = self.ui.select_strategy(strategies)
+            # Seleccionar modo de estrategia
+            mode, selected_strategies = self.ui.select_strategy_mode(strategies)
             
-            # Calcular asignaciones
-            allocations = self.calculate_allocations(strategy, total_amount)
+            # Calcular asignaciones según el modo
+            if mode == "combined":
+                allocations = self.calculate_combined_allocations(
+                    selected_strategies, total_amount
+                )
+            else:
+                allocations = self.calculate_allocations(
+                    selected_strategies[0], total_amount
+                )
             
             # Confirmar ejecución
             if not self.ui.confirm_execution(allocations):
@@ -898,8 +1004,11 @@ class TradingOrchestrator:
                 print("\n❌ Operación cancelada.")
                 return
             
+            # Consolidar órdenes del mismo token antes de ejecutar
+            consolidated = self.consolidate_allocations(allocations)
+            
             # Ejecutar órdenes
-            results = self.execute_orders(allocations)
+            results = self.execute_orders(consolidated)
             
             # Mostrar resumen
             self.print_summary(results)
