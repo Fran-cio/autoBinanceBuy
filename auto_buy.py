@@ -64,12 +64,19 @@ logger = setup_logging()
 # =============================================================================
 
 @dataclass
+class TokenSelection:
+    """Representa un token seleccionado con su porcentaje de distribución."""
+    token: str
+    distribution_percentage: float  # Porcentaje de la categoría asignado a este token (0-100)
+
+
+@dataclass
 class CategoryAllocation:
     """Representa una categoría de inversión dentro de una estrategia."""
     name: str
     percentage: float
     options: list[str]
-    selected_token: Optional[str] = None
+    selected_tokens: list[TokenSelection] = field(default_factory=list)
 
 
 @dataclass
@@ -493,18 +500,18 @@ class UserInterface:
                 print("❌ Por favor ingrese un número.")
     
     @staticmethod
-    def select_token_for_category(category: CategoryAllocation) -> str:
+    def select_tokens_for_category(category: CategoryAllocation) -> list[TokenSelection]:
         """
-        Permite al usuario seleccionar un token cuando hay múltiples opciones.
+        Permite al usuario seleccionar uno o varios tokens con distribución personalizada.
         
         Args:
             category: Categoría con múltiples opciones.
             
         Returns:
-            str: Token seleccionado.
+            list[TokenSelection]: Lista de tokens seleccionados con su distribución.
         """
         if len(category.options) == 1:
-            return category.options[0]
+            return [TokenSelection(token=category.options[0], distribution_percentage=100.0)]
         
         print(f"\n🔄 Categoría: {category.name} ({category.percentage}%)")
         print("   Opciones disponibles:")
@@ -512,20 +519,138 @@ class UserInterface:
         for idx, option in enumerate(category.options, 1):
             print(f"   [{idx}] {option}")
         
+        # Preguntar si quiere distribuir entre varios tokens
+        print("\n   ¿Cómo desea asignar esta categoría?")
+        print("   [1] Seleccionar UN solo token (100%)")
+        print("   [2] Distribuir entre VARIOS tokens")
+        
         while True:
-            try:
-                choice = input(f"   Seleccione token para {category.name}: ").strip()
-                idx = int(choice) - 1
-                
-                if 0 <= idx < len(category.options):
-                    selected = category.options[idx]
-                    logger.info(f"   ✓ Seleccionado: {selected}")
-                    return selected
-                else:
-                    print("   ❌ Opción inválida.")
+            mode_choice = input("   Seleccione modo (1 o 2): ").strip()
+            if mode_choice in ["1", "2"]:
+                break
+            print("   ❌ Por favor ingrese 1 o 2.")
+        
+        if mode_choice == "1":
+            # Modo: seleccionar un solo token
+            while True:
+                try:
+                    choice = input(f"   Seleccione token para {category.name}: ").strip()
+                    idx = int(choice) - 1
                     
-            except ValueError:
-                print("   ❌ Por favor ingrese un número.")
+                    if 0 <= idx < len(category.options):
+                        selected = category.options[idx]
+                        logger.info(f"   ✓ Seleccionado: {selected} (100%)")
+                        return [TokenSelection(token=selected, distribution_percentage=100.0)]
+                    else:
+                        print("   ❌ Opción inválida.")
+                        
+                except ValueError:
+                    print("   ❌ Por favor ingrese un número.")
+        
+        else:
+            # Modo: distribuir entre varios tokens
+            return UserInterface._select_multiple_tokens_with_distribution(category)
+    
+    @staticmethod
+    def _select_multiple_tokens_with_distribution(
+        category: CategoryAllocation
+    ) -> list[TokenSelection]:
+        """
+        Permite seleccionar múltiples tokens y asignar porcentajes de distribución.
+        
+        Args:
+            category: Categoría con opciones de tokens.
+            
+        Returns:
+            list[TokenSelection]: Tokens seleccionados con distribución.
+        """
+        selections: list[TokenSelection] = []
+        remaining_percentage = 100.0
+        available_options = category.options.copy()
+        
+        print(f"\n   📊 Distribución para {category.name}:")
+        print(f"   (El total debe sumar 100%)")
+        
+        while remaining_percentage > 0 and available_options:
+            print(f"\n   Porcentaje restante por asignar: {remaining_percentage:.1f}%")
+            print("   Tokens disponibles:")
+            
+            for idx, option in enumerate(available_options, 1):
+                print(f"   [{idx}] {option}")
+            
+            # Seleccionar token
+            while True:
+                try:
+                    choice = input("   Seleccione token: ").strip()
+                    idx = int(choice) - 1
+                    
+                    if 0 <= idx < len(available_options):
+                        selected_token = available_options[idx]
+                        break
+                    else:
+                        print("   ❌ Opción inválida.")
+                except ValueError:
+                    print("   ❌ Por favor ingrese un número.")
+            
+            # Asignar porcentaje
+            while True:
+                try:
+                    # Si es el último token disponible o el usuario lo desea, asignar el resto
+                    if len(available_options) == 1:
+                        pct = remaining_percentage
+                        print(f"   Asignando automáticamente {pct:.1f}% a {selected_token}")
+                    else:
+                        pct_input = input(
+                            f"   Porcentaje para {selected_token} "
+                            f"(máx {remaining_percentage:.1f}%, 'r' para el resto): "
+                        ).strip().lower()
+                        
+                        if pct_input == 'r':
+                            pct = remaining_percentage
+                        else:
+                            pct = float(pct_input)
+                    
+                    if pct <= 0:
+                        print("   ❌ El porcentaje debe ser mayor a 0.")
+                        continue
+                    
+                    if pct > remaining_percentage:
+                        print(f"   ❌ El porcentaje no puede superar {remaining_percentage:.1f}%")
+                        continue
+                    
+                    # Agregar selección
+                    selections.append(TokenSelection(token=selected_token, distribution_percentage=pct))
+                    remaining_percentage -= pct
+                    available_options.remove(selected_token)
+                    
+                    logger.info(f"   ✓ {selected_token}: {pct:.1f}%")
+                    break
+                    
+                except ValueError:
+                    print("   ❌ Por favor ingrese un número válido.")
+            
+            # Si quedan tokens y porcentaje, preguntar si continuar
+            if remaining_percentage > 0 and available_options:
+                continue_choice = input("   ¿Agregar otro token? (s/n): ").strip().lower()
+                if continue_choice not in ["s", "si", "sí", "y", "yes"]:
+                    # Asignar el resto al último token seleccionado
+                    if selections:
+                        selections[-1] = TokenSelection(
+                            token=selections[-1].token,
+                            distribution_percentage=selections[-1].distribution_percentage + remaining_percentage
+                        )
+                        logger.info(
+                            f"   ✓ Resto ({remaining_percentage:.1f}%) asignado a {selections[-1].token}"
+                        )
+                        remaining_percentage = 0
+        
+        # Mostrar resumen de la distribución
+        print(f"\n   📋 Distribución final para {category.name}:")
+        for sel in selections:
+            actual_pct = category.percentage * sel.distribution_percentage / 100
+            print(f"      • {sel.token}: {sel.distribution_percentage:.1f}% ({actual_pct:.2f}% del total)")
+        
+        return selections
     
     @staticmethod
     def confirm_execution(allocations: list[tuple[str, Decimal]]) -> bool:
@@ -595,6 +720,8 @@ class TradingOrchestrator:
         """
         Calcula las asignaciones de capital según la estrategia.
         
+        Soporta distribución entre múltiples tokens por categoría.
+        
         Args:
             strategy: Estrategia de inversión.
             total_amount: Monto total a invertir.
@@ -602,22 +729,27 @@ class TradingOrchestrator:
         Returns:
             list: Lista de tuplas (token, monto).
         """
-        allocations = []
+        allocations: list[tuple[str, Decimal]] = []
         
         print("\n" + "-" * 40)
         print("🎯 CONFIGURACIÓN DE TOKENS")
         print("-" * 40)
         
         for category in strategy.categories:
-            # Seleccionar token si hay múltiples opciones
-            selected_token = self.ui.select_token_for_category(category)
-            category.selected_token = selected_token
+            # Seleccionar tokens (puede ser uno o varios con distribución)
+            selected_tokens = self.ui.select_tokens_for_category(category)
+            category.selected_tokens = selected_tokens
             
-            # Calcular monto
-            amount = total_amount * Decimal(str(category.percentage)) / Decimal("100")
-            amount = amount.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            # Calcular monto base de la categoría
+            category_amount = total_amount * Decimal(str(category.percentage)) / Decimal("100")
             
-            allocations.append((selected_token, amount))
+            # Distribuir entre los tokens seleccionados
+            for token_selection in selected_tokens:
+                # Calcular monto para este token según su distribución dentro de la categoría
+                token_amount = category_amount * Decimal(str(token_selection.distribution_percentage)) / Decimal("100")
+                token_amount = token_amount.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                
+                allocations.append((token_selection.token, token_amount))
         
         return allocations
     
