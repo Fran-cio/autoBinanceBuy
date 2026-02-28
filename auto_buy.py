@@ -212,6 +212,113 @@ class BinanceTrader:
             logger.error(f"Error al obtener saldo: {e.message}")
             raise
     
+    def get_all_spot_balances(self) -> list[dict]:
+        """
+        Obtiene todos los balances spot con saldo mayor a 0.
+        
+        Returns:
+            list[dict]: Lista de balances con asset, free y locked.
+        """
+        try:
+            account = self.client.get_account()
+            balances = []
+            
+            for balance in account["balances"]:
+                free = Decimal(balance["free"])
+                locked = Decimal(balance["locked"])
+                total = free + locked
+                
+                if total > 0:
+                    balances.append({
+                        "asset": balance["asset"],
+                        "free": free,
+                        "locked": locked,
+                        "total": total
+                    })
+            
+            return balances
+        except BinanceAPIException as e:
+            logger.error(f"Error al obtener balances: {e.message}")
+            raise
+    
+    def get_spot_balances_with_value(self) -> list[dict]:
+        """
+        Obtiene todos los balances spot con su valor estimado en USDC.
+        Excluye stablecoins que no pueden venderse a USDC.
+        
+        Returns:
+            list[dict]: Lista de balances con valor en USDC.
+        """
+        balances = self.get_all_spot_balances()
+        balances_with_value = []
+        
+        # Stablecoins que no se pueden/deben vender a USDC
+        stablecoins = {"USDC", "USDT", "BUSD", "TUSD", "USDP", "FDUSD"}
+        
+        for balance in balances:
+            asset = balance["asset"]
+            free = balance["free"]
+            
+            if asset == self.BASE_ASSET:
+                # USDC es el activo base, mantener info
+                balance["usdc_value"] = free
+                balance["can_sell"] = False
+                balance["reason"] = "Activo base"
+                balances_with_value.append(balance)
+                continue
+            
+            if asset in stablecoins:
+                balance["usdc_value"] = free  # 1:1 aproximado
+                balance["can_sell"] = False
+                balance["reason"] = "Stablecoin"
+                balances_with_value.append(balance)
+                continue
+            
+            if free <= 0:
+                continue
+            
+            # Intentar obtener precio del par contra USDC
+            symbol = f"{asset}{self.BASE_ASSET}"
+            try:
+                price = self.get_current_price(symbol)
+                usdc_value = free * price
+                
+                # Verificar mínimo notional
+                min_notional = self.get_min_notional(symbol)
+                can_sell = usdc_value >= min_notional
+                
+                balance["usdc_value"] = usdc_value
+                balance["price"] = price
+                balance["symbol"] = symbol
+                balance["can_sell"] = can_sell
+                balance["min_notional"] = min_notional
+                if not can_sell:
+                    balance["reason"] = f"Valor menor a min ({min_notional} USDC)"
+                
+                balances_with_value.append(balance)
+                
+            except Exception as e:
+                logger.debug(f"No se pudo obtener precio para {symbol}: {e}")
+                # Intentar con par USDT como alternativa
+                try:
+                    usdt_symbol = f"{asset}USDT"
+                    price = self.get_current_price(usdt_symbol)
+                    usdc_value = free * price  # Aproximado
+                    balance["usdc_value"] = usdc_value
+                    balance["can_sell"] = False
+                    balance["reason"] = "Sin par USDC directo"
+                    balances_with_value.append(balance)
+                except Exception:
+                    balance["usdc_value"] = Decimal("0")
+                    balance["can_sell"] = False
+                    balance["reason"] = "Sin precio disponible"
+                    balances_with_value.append(balance)
+        
+        # Ordenar por valor USDC descendente
+        balances_with_value.sort(key=lambda x: x["usdc_value"], reverse=True)
+        
+        return balances_with_value
+    
     def get_symbol_info(self, symbol: str) -> Optional[dict]:
         """
         Obtiene información del símbolo incluyendo filtros de trading.
@@ -424,6 +531,74 @@ class BinanceTrader:
         except Exception as e:
             logger.error(f"❌ Error inesperado en {symbol}: {str(e)}")
             return None
+    
+    def execute_market_sell(
+        self, 
+        token: str, 
+        quantity: Decimal
+    ) -> Optional[dict]:
+        """
+        Ejecuta una orden de venta MARKET para convertir a USDC.
+        
+        Args:
+            token: Token a vender (ej. BTC, ETH).
+            quantity: Cantidad del token a vender.
+            
+        Returns:
+            dict: Resultado de la orden o None si falla.
+        """
+        symbol = f"{token}{self.BASE_ASSET}"
+        
+        logger.info(f"📊 Preparando orden SELL para {symbol}...")
+        logger.debug(f"Cantidad a vender: {quantity}")
+        
+        # Obtener y ajustar según LOT_SIZE
+        min_qty, max_qty, step_size = self.get_lot_size_info(symbol)
+        adjusted_quantity = self.adjust_quantity_to_lot_size(quantity, step_size)
+        
+        if adjusted_quantity < min_qty:
+            logger.warning(f"❌ Cantidad {adjusted_quantity} menor a minQty ({min_qty})")
+            return None
+        
+        # Verificar valor mínimo notional
+        current_price = self.get_current_price(symbol)
+        estimated_value = adjusted_quantity * current_price
+        min_notional = self.get_min_notional(symbol)
+        
+        if estimated_value < min_notional:
+            logger.warning(
+                f"❌ Valor estimado {estimated_value:.2f} USDC menor al mínimo ({min_notional} USDC)"
+            )
+            return None
+        
+        try:
+            # Ejecutar orden de venta de mercado
+            order = self.client.order_market_sell(
+                symbol=symbol,
+                quantity=float(adjusted_quantity)
+            )
+            
+            executed_qty = order.get("executedQty", "0")
+            cummulative_quote = order.get("cummulativeQuoteQty", "0")
+            
+            logger.info(
+                f"✅ VENTA EJECUTADA | {symbol} | "
+                f"Cantidad: {executed_qty} | "
+                f"Recibido: {cummulative_quote} USDC | "
+                f"OrderID: {order['orderId']}"
+            )
+            
+            return order
+            
+        except BinanceOrderException as e:
+            logger.error(f"❌ Error en venta {symbol}: {e.message}")
+            return None
+        except BinanceAPIException as e:
+            logger.error(f"❌ Error API en venta {symbol}: {e.message}")
+            return None
+        except Exception as e:
+            logger.error(f"❌ Error inesperado en venta {symbol}: {str(e)}")
+            return None
 
 
 # =============================================================================
@@ -523,25 +698,48 @@ class UserInterface:
         Returns:
             list[TokenSelection]: Lista de tokens seleccionados con su distribución.
         """
-        if len(category.options) == 1:
-            return [TokenSelection(token=category.options[0], distribution_percentage=100.0)]
-        
         print(f"\n🔄 Categoría: {category.name} ({category.percentage}%)")
         print("   Opciones disponibles:")
         
         for idx, option in enumerate(category.options, 1):
             print(f"   [{idx}] {option}")
+
+        if len(category.options) == 1:
+            print("\n   ¿Qué desea hacer con esta categoría?")
+            print(f"   [1] Invertir en {category.options[0]} (100%)")
+            print("   [2] Saltear esta categoría")
+
+            while True:
+                mode_choice = input("   Seleccione modo (1 o 2): ").strip()
+
+                if mode_choice == "1":
+                    selected = category.options[0]
+                    logger.info(f"   ✓ Seleccionado: {selected} (100%)")
+                    return [TokenSelection(token=selected, distribution_percentage=100.0)]
+
+                if mode_choice == "2":
+                    logger.info(f"   ⏭️ Categoría omitida: {category.name}")
+                    print("   ⏭️  Categoría omitida. Su porcentaje se redistribuirá automáticamente.")
+                    return []
+
+                print("   ❌ Por favor ingrese 1 o 2.")
         
         # Preguntar si quiere distribuir entre varios tokens
         print("\n   ¿Cómo desea asignar esta categoría?")
         print("   [1] Seleccionar UN solo token (100%)")
         print("   [2] Distribuir entre VARIOS tokens")
+        print("   [3] Saltear esta categoría")
         
         while True:
-            mode_choice = input("   Seleccione modo (1 o 2): ").strip()
-            if mode_choice in ["1", "2"]:
+            mode_choice = input("   Seleccione modo (1, 2 o 3): ").strip()
+            if mode_choice in ["1", "2", "3"]:
                 break
-            print("   ❌ Por favor ingrese 1 o 2.")
+            print("   ❌ Por favor ingrese 1, 2 o 3.")
+
+        if mode_choice == "3":
+            logger.info(f"   ⏭️ Categoría omitida: {category.name}")
+            print("   ⏭️  Categoría omitida. Su porcentaje se redistribuirá automáticamente.")
+            return []
         
         if mode_choice == "1":
             # Modo: seleccionar un solo token
@@ -712,6 +910,171 @@ class UserInterface:
                 return False
             else:
                 print("Por favor responda 's' o 'n'.")
+    
+    @staticmethod
+    def select_main_action() -> str:
+        """
+        Permite al usuario seleccionar la acción principal.
+        
+        Returns:
+            str: 'buy' para comprar, 'take_profit' para tomar ganancia.
+        """
+        print("\n📋 ¿Qué desea hacer?")
+        print("-" * 40)
+        print("  [1] 💰 COMPRAR - Distribuir USDC en tokens")
+        print("  [2] 💵 TOMAR GANANCIA - Vender todo a USDC")
+        print()
+        
+        while True:
+            try:
+                choice = input("Seleccione acción (1 o 2): ").strip()
+                if choice == "1":
+                    return "buy"
+                elif choice == "2":
+                    return "take_profit"
+                else:
+                    print("❌ Por favor ingrese 1 o 2.")
+            except Exception:
+                print("❌ Por favor ingrese un número válido.")
+    
+    @staticmethod
+    def display_spot_balances(balances: list[dict]) -> None:
+        """
+        Muestra los balances spot del usuario.
+        
+        Args:
+            balances: Lista de balances con valor en USDC.
+        """
+        print("\n" + "=" * 60)
+        print("💼 BALANCES EN SPOT")
+        print("=" * 60)
+        
+        total_value = Decimal("0")
+        sellable_value = Decimal("0")
+        
+        for balance in balances:
+            asset = balance["asset"]
+            free = balance["free"]
+            usdc_value = balance["usdc_value"]
+            can_sell = balance.get("can_sell", False)
+            
+            total_value += usdc_value
+            
+            if can_sell:
+                sellable_value += usdc_value
+                status = "✅ Vendible"
+            else:
+                reason = balance.get("reason", "")
+                status = f"⚠️ {reason}"
+            
+            print(f"  {asset:8} | {free:>15.8f} | ~{usdc_value:>12.2f} USDC | {status}")
+        
+        print("-" * 60)
+        print(f"  {'TOTAL':8} | {'':<15} | ~{total_value:>12.2f} USDC")
+        print(f"  {'VENDIBLE':8} | {'':<15} | ~{sellable_value:>12.2f} USDC")
+        print("=" * 60)
+    
+    @staticmethod
+    def select_tokens_to_sell(balances: list[dict]) -> list[dict]:
+        """
+        Permite al usuario seleccionar qué tokens vender.
+        
+        Args:
+            balances: Lista de balances vendibles.
+            
+        Returns:
+            list[dict]: Balances seleccionados para vender.
+        """
+        sellable = [b for b in balances if b.get("can_sell", False)]
+        
+        if not sellable:
+            print("\n❌ No hay tokens vendibles a USDC.")
+            return []
+        
+        print("\n📊 Tokens disponibles para vender a USDC:")
+        print("-" * 50)
+        
+        for idx, balance in enumerate(sellable, 1):
+            asset = balance["asset"]
+            free = balance["free"]
+            usdc_value = balance["usdc_value"]
+            print(f"  [{idx}] {asset}: {free:.8f} (~{usdc_value:.2f} USDC)")
+        
+        print(f"\n  [A] Vender TODOS los tokens listados")
+        print(f"  [C] Cancelar")
+        
+        while True:
+            choice = input("\nSeleccione opción (número, 'A' para todos, 'C' para cancelar): ").strip().upper()
+            
+            if choice == "C":
+                return []
+            
+            if choice == "A":
+                logger.info("📌 Seleccionados todos los tokens para vender")
+                return sellable
+            
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(sellable):
+                    selected = [sellable[idx]]
+                    logger.info(f"📌 Seleccionado: {selected[0]['asset']}")
+                    return selected
+                else:
+                    print("❌ Opción inválida.")
+            except ValueError:
+                # Intentar parsear múltiples selecciones separadas por coma
+                try:
+                    indices = [int(x.strip()) - 1 for x in choice.split(",")]
+                    selected = []
+                    for idx in indices:
+                        if 0 <= idx < len(sellable):
+                            selected.append(sellable[idx])
+                    if selected:
+                        tokens = ", ".join([s["asset"] for s in selected])
+                        logger.info(f"📌 Seleccionados: {tokens}")
+                        return selected
+                    else:
+                        print("❌ Ninguna opción válida.")
+                except ValueError:
+                    print("❌ Por favor ingrese un número, 'A' o 'C'.")
+    
+    @staticmethod
+    def confirm_take_profit(tokens_to_sell: list[dict]) -> bool:
+        """
+        Muestra resumen y solicita confirmación para tomar ganancia.
+        
+        Args:
+            tokens_to_sell: Lista de tokens a vender.
+            
+        Returns:
+            bool: True si el usuario confirma.
+        """
+        print("\n" + "=" * 60)
+        print("📋 RESUMEN DE VENTAS A EJECUTAR")
+        print("=" * 60)
+        
+        total_estimated = Decimal("0")
+        
+        for balance in tokens_to_sell:
+            asset = balance["asset"]
+            free = balance["free"]
+            usdc_value = balance["usdc_value"]
+            total_estimated += usdc_value
+            print(f"  • {asset}: {free:.8f} → ~{usdc_value:.2f} USDC")
+        
+        print("-" * 40)
+        print(f"  TOTAL ESTIMADO: ~{total_estimated:.2f} USDC")
+        print("  (El monto real puede variar según precio de mercado)")
+        print("=" * 60)
+        
+        while True:
+            confirm = input("\n⚠️  ¿Confirmar venta a USDC? (s/n): ").strip().lower()
+            if confirm in ["s", "si", "sí", "y", "yes"]:
+                return True
+            elif confirm in ["n", "no"]:
+                return False
+            else:
+                print("Por favor responda 's' o 'n'.")
 
 
 # =============================================================================
@@ -759,21 +1122,58 @@ class TradingOrchestrator:
         print("\n" + "-" * 40)
         print(f"🎯 CONFIGURACIÓN DE TOKENS - {strategy.name}")
         print("-" * 40)
-        
+
+        active_categories: list[tuple[CategoryAllocation, list[TokenSelection]]] = []
+        skipped_categories: list[CategoryAllocation] = []
+
         for category in strategy.categories:
             # Seleccionar tokens (puede ser uno o varios con distribución)
             selected_tokens = self.ui.select_tokens_for_category(category)
             category.selected_tokens = selected_tokens
-            
+
+            if selected_tokens:
+                active_categories.append((category, selected_tokens))
+            else:
+                skipped_categories.append(category)
+
+        if not active_categories:
+            logger.info(
+                f"⏭️ Todas las categorías de {strategy.name} fueron omitidas. "
+                f"{total_amount:.2f} USDC permanece en saldo."
+            )
+            print(f"\n⏭️ Todas las categorías de {strategy.name} fueron omitidas.")
+            print(f"   Se mantendrán {total_amount:.2f} USDC sin invertir.")
+            return [("USDC", total_amount)]
+
+        redistribute_percentages = bool(skipped_categories)
+        active_total_percentage = sum(category.percentage for category, _ in active_categories)
+
+        if redistribute_percentages:
+            skipped_names = ", ".join(category.name for category in skipped_categories)
+            logger.info(f"⏭️ Categorías omitidas en {strategy.name}: {skipped_names}")
+            print("\n   🔁 Reajuste automático de porcentajes:")
+
+            for category, _ in active_categories:
+                adjusted_percentage = category.percentage * 100 / active_total_percentage
+                print(
+                    f"      • {category.name}: "
+                    f"{category.percentage:.2f}% -> {adjusted_percentage:.2f}%"
+                )
+
+        for category, selected_tokens in active_categories:
+            effective_percentage = category.percentage
+            if redistribute_percentages:
+                effective_percentage = category.percentage * 100 / active_total_percentage
+
             # Calcular monto base de la categoría
-            category_amount = total_amount * Decimal(str(category.percentage)) / Decimal("100")
-            
+            category_amount = total_amount * Decimal(str(effective_percentage)) / Decimal("100")
+
             # Distribuir entre los tokens seleccionados
             for token_selection in selected_tokens:
                 # Calcular monto para este token según su distribución dentro de la categoría
                 token_amount = category_amount * Decimal(str(token_selection.distribution_percentage)) / Decimal("100")
                 token_amount = token_amount.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-                
+
                 allocations.append((token_selection.token, token_amount))
         
         return allocations
@@ -1020,6 +1420,150 @@ class TradingOrchestrator:
             logger.exception(f"Error fatal: {str(e)}")
             print(f"\n❌ Error fatal: {str(e)}")
             raise
+    
+    def run_take_profit(self) -> None:
+        """
+        Ejecuta el flujo de tomar ganancia (vender todo a USDC).
+        """
+        print("\n" + "=" * 60)
+        print("💵 TOMAR GANANCIA - Convertir todo a USDC")
+        print("=" * 60)
+        
+        # Obtener balances spot con valores
+        logger.info("Obteniendo balances spot...")
+        balances = self.trader.get_spot_balances_with_value()
+        
+        if not balances:
+            print("\n❌ No se encontraron balances en spot.")
+            return
+        
+        # Mostrar balances
+        self.ui.display_spot_balances(balances)
+        
+        # Seleccionar tokens a vender
+        tokens_to_sell = self.ui.select_tokens_to_sell(balances)
+        
+        if not tokens_to_sell:
+            logger.info("❌ Operación cancelada.")
+            print("\n❌ Operación cancelada.")
+            return
+        
+        # Confirmar ejecución
+        if not self.ui.confirm_take_profit(tokens_to_sell):
+            logger.info("❌ Operación cancelada por el usuario.")
+            print("\n❌ Operación cancelada.")
+            return
+        
+        # Ejecutar ventas
+        results = self.execute_sell_orders(tokens_to_sell)
+        
+        # Mostrar resumen
+        self.print_sell_summary(results)
+    
+    def execute_sell_orders(self, tokens_to_sell: list[dict]) -> dict[str, dict]:
+        """
+        Ejecuta las órdenes de venta.
+        
+        Args:
+            tokens_to_sell: Lista de balances a vender.
+            
+        Returns:
+            dict: Resultados de las ventas por token.
+        """
+        results = {}
+        
+        print("\n" + "=" * 60)
+        print("⚡ EJECUTANDO VENTAS")
+        print("=" * 60 + "\n")
+        
+        for balance in tokens_to_sell:
+            token = balance["asset"]
+            quantity = balance["free"]
+            
+            order = self.trader.execute_market_sell(token, quantity)
+            
+            if order:
+                results[token] = {
+                    "status": "success",
+                    "order_id": order["orderId"],
+                    "sold_qty": order["executedQty"],
+                    "received_usdc": order["cummulativeQuoteQty"]
+                }
+            else:
+                results[token] = {
+                    "status": "failed",
+                    "quantity": float(quantity),
+                    "estimated_value": float(balance["usdc_value"])
+                }
+        
+        return results
+    
+    def print_sell_summary(self, results: dict[str, dict]) -> None:
+        """
+        Imprime resumen final de las ventas.
+        
+        Args:
+            results: Resultados de las ventas.
+        """
+        print("\n" + "=" * 60)
+        print("📊 RESUMEN DE VENTAS")
+        print("=" * 60)
+        
+        success_count = 0
+        failed_count = 0
+        total_received = Decimal("0")
+        
+        for token, result in results.items():
+            status = result["status"]
+            
+            if status == "success":
+                success_count += 1
+                received = Decimal(result["received_usdc"])
+                total_received += received
+                print(
+                    f"  ✅ {token}: Vendido {result['sold_qty']} "
+                    f"→ {result['received_usdc']} USDC"
+                )
+            else:
+                failed_count += 1
+                print(
+                    f"  ❌ {token}: Falló - {result.get('quantity', 0)} "
+                    f"(~{result.get('estimated_value', 0):.2f} USDC)"
+                )
+        
+        print("-" * 40)
+        print(f"  Total vendidos exitosamente: {success_count}")
+        print(f"  Total fallidos: {failed_count}")
+        print(f"  USDC recibidos: {total_received:.2f}")
+        print("=" * 60 + "\n")
+        
+        logger.info(
+            f"Take Profit completado: {success_count} éxitos, "
+            f"{failed_count} fallos, {total_received:.2f} USDC recibidos"
+        )
+    
+    def run_main(self) -> None:
+        """
+        Ejecuta el flujo principal con selección de acción.
+        """
+        try:
+            self.ui.print_header()
+            
+            # Seleccionar acción principal
+            action = self.ui.select_main_action()
+            
+            if action == "buy":
+                self.run()
+            elif action == "take_profit":
+                self.run_take_profit()
+            
+        except KeyboardInterrupt:
+            logger.warning("\n⚠️ Operación interrumpida por el usuario (Ctrl+C)")
+            print("\n\n⚠️ Operación interrumpida.")
+        except Exception as e:
+            logger.exception(f"Error fatal: {str(e)}")
+            print(f"\n❌ Error fatal: {str(e)}")
+            raise
 
 
 # =============================================================================
@@ -1046,9 +1590,9 @@ def main() -> None:
         # Inicializar cliente de trading
         trader = BinanceTrader(api_key, api_secret)
         
-        # Ejecutar orquestador
+        # Ejecutar orquestador con menú principal
         orchestrator = TradingOrchestrator(trader)
-        orchestrator.run()
+        orchestrator.run_main()
         
     except BinanceAPIException as e:
         logger.error(f"Error de Binance API: {e.message}")
